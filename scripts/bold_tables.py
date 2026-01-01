@@ -5,7 +5,8 @@ before compiling). One rule per table, stated in its caption in paper_tmlr/main.
   marker_sides_forced.tex            interactions whose 95% interval excludes zero, and
   marker_sides_forced_full.tex       (post - within) - base values whose 95% interval excludes zero
   marker_sides_forced_7b.tex         (post - within) - base values whose 95% interval excludes zero
-  control_cells.tex                  z values with |z| >= 3.54 (Bonferroni threshold)
+  control_cells.tex                  z values with |z| >= 3.54 (Bonferroni threshold), in the
+                                     stratified and cell-bootstrap columns (0-based 7 and 8)
 Further rules (real_data, ablation_32b, perpos, aligned, blind_spot_by_k, blind_spot_window, patching,
 attention_crossing, lora) are listed in RULES and stated in each caption. Idempotent: cells already in bold
 are left alone."""
@@ -40,9 +41,11 @@ def wording(text):
             cells = line.rstrip(" \\").split("&")
             for j in range(2, 6):                                  # the four post-marker columns
                 c = cells[j].strip()
-                m = re.fullmatch(r"\$\+(\d+\.\d+)\$|0\.00", c)
+                # strictly positive only: tidy_tables.py renders a small negative as a bare
+                # 0.00 too, so bolding 0.00 would claim a repair whose sign is not recoverable.
+                m = re.fullmatch(r"\$\+(\d+\.\d+)\$", c)
                 if m:
-                    cells[j] = " " + (bold_math("+" + m.group(1)) if m.group(1) else "$\\mathbf{0.00}$") + " "
+                    cells[j] = " " + bold_math("+" + m.group(1)) + " "
             line = "&".join(cells) + " \\\\"
         out.append(line)
     return "\n".join(out)
@@ -73,7 +76,11 @@ def control(text):
     for line in rows(text):
         if "&" in line and "\\\\" in line and "Model &" not in line:
             cells = line.rstrip(" \\").split("&")
-            for j in (7, 8, 9):                                    # the three z columns
+            # Two z columns now (0-based 7 = stratified, 8 = cell bootstrap): the unstratified z
+            # was dropped when the stratified one became primary, shifting both left by one and
+            # leaving 9 as the signed "Delta at N = 64", which this rule must not touch. The
+            # model-level rows carry "--" in both and so match nothing.
+            for j in (7, 8):
                 c = cells[j].strip()
                 # a negative z arrives as $-3.8$ (tidy_tables.py has already made the minus a
                 # math minus), so match it with or without the dollars and bold it in kind
