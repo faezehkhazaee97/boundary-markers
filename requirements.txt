@@ -1,0 +1,11 @@
+# Versions used for the final runs (Python 3.11; CUDA 12.4 build of torch).
+torch==2.6.0
+transformers==5.12.1
+accelerate==1.14.0
+numpy==2.4.6
+pandas==3.0.3
+scipy==1.17.1
+matplotlib==3.11.0
+seaborn==0.13.2
+tqdm==4.68.3
+google-genai==2.10.0   # Gemini runs only

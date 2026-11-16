@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Figure 2 (main paper): the optimal boundary density shifts from dense
+(short N) to moderate/sparse (long N) -- shown identically across all
+three tiers, Qwen2.5-32B-Instruct only. One row per tier (cyclic_shift /
+copy_previous / sliding_window_max), one panel per representative N,
+TAR vs. boundary density with the empirical best point marked with a star.
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from tasks.common.figure_style import set_rc, savefig, MULTI_COL_WIDTH, set_power_of_2_xticks
+
+set_rc()
+
+MODEL = "Qwen2.5-32B-Instruct"
+
+# Validated palette (dataviz skill, references/palette.md)
+CAT_ORANGE = "#D55E00"  # Okabe-Ito vermilion -- the Cellular_Bounds line
+CAT_BLUE = "#0072B2"    # Okabe-Ito blue -- the best-density star
+
+
+def load_task(task, axis_val_col, axis_val, n128_path=None):
+    grid_dir = REPO_ROOT / "results_clean" / task / "grid"
+    frames = []
+    # Only this model's own grid files: MODEL.csv and MODEL_<suffix>.csv (trial batches, N = 128).
+    # Excluded: *_POOLED_* summaries (cyclic_shift's holds a legacy batch under the same trial
+    # numbers) and the LoRA runs (MODEL-lorabase.csv, MODEL-lorasep.csv), which a bare MODEL*
+    # glob would also match. Sorted, so the drop_duplicates below is deterministic.
+    for p in sorted(grid_dir.glob(f"{MODEL}*.csv")):
+        if not (p.name == f"{MODEL}.csv" or p.name.startswith(f"{MODEL}_")) or "POOLED" in p.name:
+            continue
+        frames.append(pd.read_csv(p))
+    df = pd.concat(frames, ignore_index=True)
+    key_cols = [c for c in ["Method", "Interval", "Seq_Length", axis_val_col, "Trial"] if c and c in df.columns]
+    df = df.drop_duplicates(subset=key_cols)
+    df = df[df.Interval != 3]
+    if axis_val_col:
+        df = df[df[axis_val_col] == axis_val]
+    return df
+
+
+COMMON_N = [4, 8, 16, 32, 64, 128]
+TASKS = [
+    ("cyclic_shift", "Alphabet_Size", 8, COMMON_N, "(a) cyclic_shift"),
+    ("copy_previous", None, None, COMMON_N, "(b) copy_previous"),
+    ("sliding_window_max", "Alphabet_Size", 8, COMMON_N, "(c) sliding_window_max"),  # matches cyclic_shift's alphabet=8; copy_previous is binary-only, no match possible
+]
+
+fig, axes = plt.subplots(3, 6, figsize=(MULTI_COL_WIDTH * 1.4, 6.0))
+
+for row, (task, axis_col, axis_val, lengths, panel_label) in enumerate(TASKS):
+    df = load_task(task, axis_col, axis_val)
+    chance = 1.0 / axis_val if axis_val else 0.5  # copy_previous is binary, no Alphabet_Size axis
+    for col in range(6):
+        ax = axes[row, col]
+        if col >= len(lengths):
+            ax.axis("off")
+            continue
+        N = lengths[col]
+        sub = df[df.Seq_Length == N]
+        n_tr = sub.groupby(["Method", "Interval"]).Trial.nunique()
+        print(f"{task:20s} N={N:4d}: trials per cell {n_tr.min()}-{n_tr.max()}")
+        base = sub[sub.Method == "Base"]["TAR"]
+        bnd = sub[sub.Method == "Cellular_Bounds"].groupby("Interval")["TAR"].agg(["mean", "sem"])
+        ax.axhline(chance, color="#999999", linestyle=":", linewidth=1, alpha=0.8,
+                   label="Random chance" if (row == 0 and col == 0) else None)
+        if len(base):
+            ax.axhline(base.mean(), color="black", linestyle="--", linewidth=1, alpha=0.6, label="Base" if (row == 0 and col == 0) else None)
+        if len(bnd):
+            density = 1.0 / bnd.index.values
+            order = np.argsort(density)
+            ax.errorbar(density[order], bnd["mean"].values[order], yerr=bnd["sem"].values[order],
+                        color=CAT_ORANGE, marker="o", markersize=4, linewidth=1.5, capsize=2)
+            best_idx = bnd["mean"].values[order].argmax()
+            ax.scatter([density[order][best_idx]], [bnd["mean"].values[order][best_idx]],
+                      marker="*", s=140, color=CAT_BLUE, zorder=5, edgecolor="black", linewidth=0.5)
+            # Rotated 45 degrees so 1/16 ... 1 do not overlap in the narrow panels
+            set_power_of_2_xticks(ax, density[order], fontsize=6)
+            plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+            ax.tick_params(axis="x", pad=1.5)
+            ax.set_xlim(0.045, 1.3)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"N={N}", fontsize=8)
+        if row == 2:
+            ax.set_xlabel("Boundary density (1/k)")
+        if col == 0:
+            ax.set_ylabel("TAR", fontsize=7.5)
+    # Row-level panel label, placed left of the row rather than folded into
+    # the y-axis text -- ICLR convention for a multi-panel figure where each
+    # row is a genuinely distinct analysis (task), not just a parameter sweep.
+    axes[row, 0].annotate(panel_label, xy=(-0.62, 0.5), xycoords="axes fraction",
+                           fontsize=8.5, fontweight="bold", ha="center", va="center", rotation=90)
+
+handles, labels = axes[0, 0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.0), ncol=2, frameon=False, fontsize=7.5)
+fig.tight_layout(rect=[0.02, 0, 1, 0.95])
+fig.align_xlabels(axes[2, :])  # rotated tick labels differ in height; keep the x labels on one line
+
+OUT = REPO_ROOT / "figs" / "fig2_vertex_migration.pdf"
+savefig(fig, OUT)
+fig.savefig(str(OUT).replace("figs/", "figs/png/").replace(".pdf", ".png"), dpi=150, bbox_inches="tight")

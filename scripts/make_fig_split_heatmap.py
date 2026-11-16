@@ -1,0 +1,206 @@
+"""Paper Figure 1: the helps / cancelled / restored split, every task x model.
+
+One cell = pooled TAR change (Cellular_Bounds - Base) for a task and model,
+pooled over N in {4,8,16,32,64}, every tested density (k=3 excluded), and
+every alphabet/modulus value. Lengths are capped at 64 so every model is
+pooled over the same grid (the 32B-only N=128 extension and cyclic_shift's
+N=128/256 are left out here). '*' marks |delta / combined SEM| at or above the
+Bonferroni threshold across all pooled cells the paper tests (two-sided p < 0.05).
+
+Three row blocks: position-local tasks, dependency tasks as-is, and the same
+dependency tasks with the dependency severed at each marker (reset variants).
+Models without data for a cell are left blank. Newly added models
+(Qwen3.8-27B, Gemma-4-31B-it) appear automatically once their grid CSVs exist.
+
+Outputs: figs/fig1_split_heatmap.pdf (+ png) and
+results_clean/_summary/split_heatmap_values.csv (the numbers quoted in the text).
+"""
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from tasks.common.pooled import pooled_delta as _pooled  # noqa: E402
+from tasks.common.figure_style import set_rc, savefig, _plain_labels, MULTI_COL_WIDTH  # noqa: E402
+
+LENGTHS = [4, 8, 16, 32, 64]
+VMAX = 0.30
+SIG_Z = None  # set below to the Bonferroni threshold over the plotted cells
+
+# The reset variants are deliberately NOT a block here. They change the rule at the position after
+# each marker, so Bounds - Base would compare a different ground-truth function against a baseline
+# whose prompt never triggers the reset (and whose no-marker accuracy shifts by -0.08 to +0.06).
+# The valid comparison is per-position across marker runs alone, which is Figure~\ref{fig:reset}.
+ROW_BLOCKS = [
+    ("Position-local", ["cyclic_shift", "random_permutation", "conditional_shift"]),
+    ("Dependency, as is", ["copy_previous", "running_xor", "running_sum_local", "sliding_window_max"]),
+]
+RESET_BLOCK = "Reset rule"          # retained so the values CSV keeps its column name
+CSV_BLOCK = {RESET_BLOCK: "Dependency severed (reset variant)"}  # block name kept stable in the values CSV
+# Displayed block titles, one header row above each block, starting with the panel letter. The reset
+# variants change the rule at the position after each marker (different tasks with their own shifted
+# no-marker baselines); the caption says so.
+BLOCK_TITLES = {"Position-local": "(a) Position-local tasks", "Dependency, as is": "(b) Dependency tasks"}
+# (column label, local model tag or None for Gemini)
+MODELS = [
+    ("Qwen2.5\n7B", "Qwen2.5-7B-Instruct"),
+    ("Qwen2.5\n14B", "Qwen2.5-14B-Instruct"),
+    ("Qwen2.5\n32B", "Qwen2.5-32B-Instruct"),
+    ("Mistral\n7B", "Mistral-7B-Instruct-v0.3"),
+    ("Phi-3.5\nmini", "Phi-3.5-mini-instruct"),
+    ("Qwen3.8\n27B", "Qwen3.8-27B"),
+    ("Gemma 4\n31B", "gemma-4-31B-it"),
+    ("Gemini\n3.5 Flash", None),
+    ("Gemini\n3.6 Flash", "gemini36"),
+]
+GEMINI_CSV = REPO / "results_clean" / "gemini_pilot" / "gemini-flash-latest_POOLED_3trials.csv"
+GEMINI36_CSV = REPO / "results_clean" / "gemini_pilot" / "gemini-3.6-flash_POOLED.csv"
+
+# Diverging pair from the validated palette (blue <-> red, neutral gray midpoint).
+CMAP = LinearSegmentedColormap.from_list("helps_hurts", ["#D55E00", "#f0efec", "#0072B2"])
+INK, INK_ON_DARK, BLANK = "#1a1a1a", "#ffffff", "#fcfcfb"
+
+
+def load_local(task, tag):
+    # Raw per-generation files only. *_POOLED_* summaries are skipped: for cyclic_shift at
+    # Qwen2.5-7B/14B/32B they hold a second, "legacy" batch under the same trial numbers,
+    # which sorts first and would silently replace the raw (k=1-budget-corrected) batch.
+    files = [f for f in sorted((REPO / "results_clean" / task / "grid").glob(f"{tag}*.csv"))
+             if (f.name == f"{tag}.csv" or f.name.startswith(f"{tag}_"))
+             if "POOLED" not in f.name]
+    if not files:
+        return None
+    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    axis = next((c for c in ("Alphabet_Size", "Modulus") if c in df.columns), None)
+    keys = ["Method", "Interval", "Seq_Length", "Trial"] + ([axis] if axis else [])
+    return df.drop_duplicates(subset=keys)
+
+
+def load_gemini(task, path=None):
+    path = path or GEMINI_CSV
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df = df[df.Task == task]
+    return df if len(df) else None
+
+
+def pooled_delta(df):
+    """Length-matched pooled effect (tasks/common/pooled.py)."""
+    return _pooled(df, lengths=LENGTHS)
+
+
+rows, records = [], []
+for block, tasks in ROW_BLOCKS:
+    for task in tasks:
+        cells = []
+        for label, tag in MODELS:
+            df = (load_gemini(task) if tag is None else load_gemini(task, GEMINI36_CSV) if tag == "gemini36"
+                  else load_local(task, tag))
+            r = pooled_delta(df) if df is not None else None
+            cells.append(r)
+            if r:
+                records.append(dict(block=CSV_BLOCK.get(block, block.replace("\n", " ")), task=task,
+                                    model=label.replace("\n", " "), **r))
+        rows.append((block, task, cells))
+
+# Drop model columns with no data at all (e.g. new models before their runs finish).
+keep = [j for j in range(len(MODELS)) if any(cells[j] for _, _, cells in rows)]
+models = [MODELS[j] for j in keep]
+rows = [(b, t, [c[j] for j in keep]) for b, t, c in rows]
+
+from scipy.stats import norm  # noqa: E402
+# Bonferroni, two-sided, over every pooled cell the paper tests: the cells plotted here plus the
+# 42 tokenization-control cells (3 position-local tasks x 7 open models x {spaced, digits}).
+# The 15 reset-variant cells are still counted here although they are no longer plotted: they were
+# run and computed, and keeping them in the family leaves the threshold where the paper states it
+# (|z| >= 3.54 over 125 cells). Dropping them would lower it to 3.51, which is less conservative.
+RESET_CELLS_NOT_PLOTTED = 15
+N_FAMILY = len(records) + 42 + (6 if GEMINI36_CSV.exists() else 0) + RESET_CELLS_NOT_PLOTTED
+SIG_Z = norm.ppf(1 - 0.05 / (2 * N_FAMILY))
+print(f"{len(records)} cells plotted, family of {N_FAMILY}; star threshold |z| >= {SIG_Z:.2f}")
+
+out_csv = REPO / "results_clean" / "_summary" / "split_heatmap_values.csv"
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+pd.DataFrame(records).round(4).to_csv(out_csv, index=False)
+print(f"Wrote {out_csv}")
+
+set_rc()
+# A header row (None) above each block: it holds the block's title and opens a gap.
+blocked = []
+for block, _ in ROW_BLOCKS:
+    blocked.append(("header", block))
+    blocked += [r for r in rows if r[0] == block]
+rows = blocked
+n_rows, n_cols = len(rows), len(models)
+fig, ax = plt.subplots(figsize=(MULTI_COL_WIDTH * 0.92, 0.27 * n_rows + 1.0))
+grid = np.full((n_rows, n_cols), np.nan)
+for i, row in enumerate(rows):
+    if row[0] == "header":
+        continue
+    for j, c in enumerate(row[2]):
+        if c:
+            grid[i, j] = c["delta"]
+
+ax.set_facecolor(BLANK)
+im = ax.imshow(np.ma.masked_invalid(grid), cmap=CMAP, vmin=-VMAX, vmax=VMAX, aspect="auto")
+for i, row in enumerate(rows):
+    if row[0] == "header":
+        continue
+    for j, c in enumerate(row[2]):
+        if not c:
+            ax.text(j, i, "—", ha="center", va="center", fontsize=7, color="#9a9a96")
+            continue
+        d = 0.0 if abs(c["delta"]) < 0.005 else c["delta"]        # no signed zeros
+        txt = (f"{d:+.2f}" if d else "0.00") + ("*" if abs(c["z"]) >= SIG_Z else "")
+        dark = abs(c["delta"]) > 0.55 * VMAX
+        ax.text(j, i, txt, ha="center", va="center", fontsize=7,
+                color=INK_ON_DARK if dark else INK)
+
+# 2px surface gaps between cells; each header row is a white band with a rule above it (except the first).
+ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+ax.grid(which="minor", color="#ffffff", linewidth=1.5)
+ax.tick_params(which="minor", length=0)
+headers = [i for i, r in enumerate(rows) if r[0] == "header"]
+for i in headers:
+    ax.axhspan(i - 0.5, i + 0.5, color="white", zorder=2)
+    if i:
+        ax.axhline(i - 0.5, color="#1a1a1a", linewidth=0.9, zorder=3)
+
+ax.set_xticks(range(n_cols))
+ax.set_xticklabels([m[0] for m in models])
+ax.xaxis.tick_bottom()   # model names below the table, so each block's title opens its block
+ax.set_yticks(range(n_rows))
+ax.set_yticklabels(["" if r[0] == "header" else r[1].replace("_reset", "") for r in rows])
+ax.set_xlim(-0.5, n_cols - 0.5)
+for s in ax.spines.values():
+    s.set_visible(False)
+ax.tick_params(length=0)
+
+cb = fig.colorbar(im, ax=ax, orientation="horizontal", fraction=0.05, pad=0.13, aspect=40, shrink=0.6)
+cb.set_label("Change in accuracy with markers")
+cb.outline.set_visible(False)
+
+# Block titles in Figure 1's panel-title style (8.5 pt, normal weight), starting with the panel
+# letter, left-aligned with the task names, on the block's header row. Measured after the paper's
+# wording is applied, since that changes the label widths.
+from matplotlib.transforms import blended_transform_factory  # noqa: E402
+_plain_labels(fig)
+fig.canvas.draw()
+renderer = fig.canvas.get_renderer()
+x_left = min(t.get_window_extent(renderer).x0 for t in ax.get_yticklabels() if t.get_text())
+x_left = ax.transAxes.inverted().transform((x_left, 0))[0]
+title_tr = blended_transform_factory(ax.transAxes, ax.transData)
+for i in headers:
+    ax.text(x_left, i + 0.25, BLOCK_TITLES[rows[i][1]], transform=title_tr, ha="left", va="baseline",
+            fontsize=plt.rcParams["axes.titlesize"], zorder=4)
+
+out = REPO / "figs" / "fig1_split_heatmap.pdf"
+savefig(fig, out)
+fig.savefig(REPO / "figs" / "png" / "fig1_split_heatmap.png", dpi=200, bbox_inches="tight")
